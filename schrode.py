@@ -4,6 +4,7 @@ import math
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib import animation
+from matplotlib import widgets
 
 N = 256
 h = 1 / N
@@ -48,12 +49,6 @@ comp_normSq_phase = cp.RawKernel(r'''
     void normSq_phase(float* normSq, float* phase, const complex<float>* psi, int N) {
         int x = blockDim.x * blockIdx.x + threadIdx.x;
         int y = blockDim.y * blockIdx.y + threadIdx.y;
-
-        if ((x == 0) || (x == (N - 1)) || (y == 0) || (y == (N - 1)))
-        {
-            return;
-        } 
-        
         int idx = y * N + x;
 
         normSq[idx] = (conj(psi[idx]) * psi[idx]).real();
@@ -72,39 +67,44 @@ def integrate_normSq(psi):
 block_size = (8, 8,)
 grid_size = (math.ceil(N / block_size[0]), math.ceil(N / block_size[1]),)
 
-# Initialize the wave function and potential
-even_psi_h = np.zeros((N, N), dtype=np.complex64)
-odd_psi_h = np.zeros((N, N), dtype=np.complex64)
-V_h = np.zeros((N, N), dtype=np.float32)
-sigma = 1 / 12.
-pos0_x = 3 * sigma
-pos0_y = 0.5
-k = -18.0 * 2*np.pi
-for x_id in range(N):
-    for y_id in range(N):
-        x = x_id * h
-        y = y_id * h
-        diff_x = x - pos0_x
-        diff_y = y - pos0_y
-        psi = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * sigma * sigma))
-        phase = np.sin(k*x) + 1j*np.cos(k*x)
-        even_psi_h[y_id, x_id] = psi * phase
-        odd_psi_h[y_id, x_id] = psi * phase
+def get_initial_condition():
+    # Initialize the wave function and potential
+    even_psi_h = np.zeros((N, N), dtype=np.complex64)
+    odd_psi_h = np.zeros((N, N), dtype=np.complex64)
+    V_h = np.zeros((N, N), dtype=np.float32)
+    sigma = 1 / 12.
+    pos0_x = 3 * sigma
+    pos0_y = 0.5
+    k = -18.0 * 2*np.pi
+    for x_id in range(N):
+        for y_id in range(N):
+            x = x_id * h
+            y = y_id * h
+            diff_x = x - pos0_x
+            diff_y = y - pos0_y
+            psi = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * sigma * sigma))
+            phase = np.sin(k*x) + 1j*np.cos(k*x)
+            even_psi_h[y_id, x_id] = psi * phase
+            odd_psi_h[y_id, x_id] = psi * phase
 
-normSq = integrate_normSq(even_psi_h)
-even_psi_h /= np.sqrt(normSq)
-odd_psi_h /= np.sqrt(normSq)
-normSq = integrate_normSq(odd_psi_h)
-print(normSq)
+    # Normalize the wave function
+    normSq = integrate_normSq(even_psi_h)
+    even_psi_h /= np.sqrt(normSq)
+    odd_psi_h /= np.sqrt(normSq)
+    normSq = integrate_normSq(odd_psi_h)
 
-V_h[0:int(N * 0.4), int(N * 0.8):int(N * 0.83)] = 999999.0
-V_h[int(N * 0.45):int(N * 0.55), int(N * 0.8):int(N * 0.83)] = 999999.0
-V_h[int(N * 0.6):N, int(N * 0.8):int(N * 0.83)] = 999999.0
+    V_h[0:int(N * 0.41), int(N * 0.8):int(N * 0.82)] = 999999.0
+    V_h[int(N * 0.46):int(N * 0.54), int(N * 0.8):int(N * 0.82)] = 999999.0
+    V_h[int(N * 0.59):N, int(N * 0.8):int(N * 0.82)] = 999999.0
 
-# Copy data from CPU to GPU
-even_psi_d = cp.array(even_psi_h.reshape(-1), dtype=cp.complex64)
-odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
-V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
+    # Copy data from CPU to GPU
+    even_psi_d = cp.array(even_psi_h.reshape(-1), dtype=cp.complex64)
+    odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
+    V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
+
+    return (even_psi_d, odd_psi_d, V_d)
+
+even_psi_d, odd_psi_d, V_d = get_initial_condition()
 
 # Initialize the visualization
 normSq_d = cp.zeros(N*N, dtype=cp.float32)
@@ -112,16 +112,26 @@ phase_d = cp.zeros(N*N, dtype=cp.float32)
 fig, ax = plt.subplots()
 comp_normSq_phase(grid_size, block_size, (normSq_d, phase_d, even_psi_d, cp.int32(N)))
 im = ax.imshow(normSq_d.get().reshape((N, N)), animated=True)
+iters_per_frame = 2
+
+# Add user interface
+def reset_clicked(event):
+    global even_psi_d, odd_psi_d, V_d
+    even_psi_d, odd_psi_d, V_d = get_initial_condition()
+reset_button_ax = plt.axes([0.81, 0.05, 0.1, 0.075])
+reset_button = widgets.Button(reset_button_ax, "Reset")
+reset_button.on_clicked(reset_clicked)
 
 def time_integrate(i, *args):
-    # Update an odd time step
-    take_timestep(grid_size, block_size, (odd_psi_d, even_psi_d, V_d, cp.float32(h), cp.float32(dt), cp.int32(N)))
-    # Update an even time step
-    take_timestep(grid_size, block_size, (even_psi_d, odd_psi_d, V_d, cp.float32(h), cp.float32(dt), cp.int32(N)))
+    for _ in range(iters_per_frame):
+        # Update an odd time step
+        take_timestep(grid_size, block_size, (odd_psi_d, even_psi_d, V_d, cp.float32(h), cp.float32(dt), cp.int32(N)))
+        # Update an even time step
+        take_timestep(grid_size, block_size, (even_psi_d, odd_psi_d, V_d, cp.float32(h), cp.float32(dt), cp.int32(N)))
 
     # Compute the probability/phase and visualize
     comp_normSq_phase(grid_size, block_size, (normSq_d, phase_d, even_psi_d, cp.int32(N)))
-    im.set_data(V_h + normSq_d.get().reshape((N, N)))
+    im.set_data(V_d.get().reshape((N, N)) + normSq_d.get().reshape((N, N)))
     return im,
 
 ani = animation.FuncAnimation(fig, time_integrate, interval=1, blit=True)
