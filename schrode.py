@@ -71,11 +71,10 @@ even_psi_h = np.zeros((N, N), dtype=np.complex64)
 odd_psi_h = np.zeros((N, N), dtype=np.complex64)
 V_h = np.zeros((N, N), dtype=np.float32)
 
-def get_initial_condition():
+def set_initial_condition():
     # Initialize the wave function and potential
-    global even_psi_h
-    global odd_psi_h
-    global V_h
+    global even_psi_h, odd_psi_h
+    global even_psi_d, odd_psi_d
     sigma = 1 / 12.
     pos0_x = 3 * sigma
     pos0_y = 0.5
@@ -97,18 +96,20 @@ def get_initial_condition():
     odd_psi_h /= np.sqrt(normSq)
     normSq = integrate_normSq(odd_psi_h)
 
-    V_h[0:int(N * 0.41), int(N * 0.8):int(N * 0.82)] = 999999.0
-    V_h[int(N * 0.46):int(N * 0.54), int(N * 0.8):int(N * 0.82)] = 999999.0
-    V_h[int(N * 0.59):N, int(N * 0.8):int(N * 0.82)] = 999999.0
-
     # Copy data from CPU to GPU
     even_psi_d = cp.array(even_psi_h.reshape(-1), dtype=cp.complex64)
     odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
+
+def set_double_slit():
+    global V_h
+    global V_d
+    V_h[0:int(N * 0.41), int(N * 0.8):int(N * 0.82)] = 999999.0
+    V_h[int(N * 0.46):int(N * 0.54), int(N * 0.8):int(N * 0.82)] = 999999.0
+    V_h[int(N * 0.59):N, int(N * 0.8):int(N * 0.82)] = 999999.0
     V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 
-    return (even_psi_d, odd_psi_d, V_d)
-
-even_psi_d, odd_psi_d, V_d = get_initial_condition()
+set_initial_condition()
+set_double_slit()
 
 # Initialize the visualization
 normSq_d = cp.zeros(N*N, dtype=cp.float32)
@@ -119,9 +120,16 @@ im = ax.imshow(normSq_d.get().reshape((N, N)), animated=True)
 iters_per_frame = 2
 
 # Add user interface
-def reset_clicked(event):
+def reset_state_clicked(event):
     global even_psi_d, odd_psi_d, V_d
-    even_psi_d, odd_psi_d, V_d = get_initial_condition()
+    set_initial_condition()
+def remove_v_clicked(event):
+    global V_h
+    global V_d
+    V_h[0:N, 0:N] = 0.0
+    V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
+def double_slit_clicked(event):
+    set_double_slit()
 left_is_down = False
 right_is_down = False
 def mouse_down(event):
@@ -146,12 +154,23 @@ def mouse_moves(event):
         V_h[int(event.ydata), int(event.xdata)] = 999999.0
         V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
     elif right_is_down:
-        V_h[int(event.ydata), int(event.xdata)] = 0
+        print("DELETE")
+        V_h[int(event.ydata), int(event.xdata)] = 0.0
+        V_h[int(event.ydata)+1, int(event.xdata)] = 0.0
+        V_h[int(event.ydata)-1, int(event.xdata)] = 0.0
+        V_h[int(event.ydata), int(event.xdata)+1] = 0.0
+        V_h[int(event.ydata), int(event.xdata)-1] = 0.0
         V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 
-reset_button_ax = plt.axes([0.81, 0.05, 0.1, 0.075])
-reset_button = widgets.Button(reset_button_ax, "Reset")
-reset_button.on_clicked(reset_clicked)
+reset_state_button_ax = plt.axes([0.81, 0.05, 0.1, 0.075])
+reset_state_button = widgets.Button(reset_state_button_ax, "Reset wave function")
+reset_state_button.on_clicked(reset_state_clicked)
+remove_v_button_ax = plt.axes([0.81, 0.2, 0.1, 0.075])
+remove_v_button = widgets.Button(remove_v_button_ax, "Remove potential")
+remove_v_button.on_clicked(remove_v_clicked)
+add_double_slit_ax = plt.axes([0.81, 0.4, 0.1, 0.075])
+add_double_slit_button = widgets.Button(add_double_slit_ax, "Add double-slit potential")
+add_double_slit_button.on_clicked(double_slit_clicked)
 fig.canvas.mpl_connect('button_press_event', mouse_down)
 fig.canvas.mpl_connect('button_release_event', mouse_up)
 fig.canvas.mpl_connect('motion_notify_event', mouse_moves)
