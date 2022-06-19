@@ -67,11 +67,15 @@ def integrate_normSq(psi):
 block_size = (8, 8,)
 grid_size = (math.ceil(N / block_size[0]), math.ceil(N / block_size[1]),)
 
+even_psi_h = np.zeros((N, N), dtype=np.complex64)
+odd_psi_h = np.zeros((N, N), dtype=np.complex64)
+V_h = np.zeros((N, N), dtype=np.float32)
+
 def get_initial_condition():
     # Initialize the wave function and potential
-    even_psi_h = np.zeros((N, N), dtype=np.complex64)
-    odd_psi_h = np.zeros((N, N), dtype=np.complex64)
-    V_h = np.zeros((N, N), dtype=np.float32)
+    global even_psi_h
+    global odd_psi_h
+    global V_h
     sigma = 1 / 12.
     pos0_x = 3 * sigma
     pos0_y = 0.5
@@ -118,9 +122,39 @@ iters_per_frame = 2
 def reset_clicked(event):
     global even_psi_d, odd_psi_d, V_d
     even_psi_d, odd_psi_d, V_d = get_initial_condition()
+left_is_down = False
+right_is_down = False
+def mouse_down(event):
+    global left_is_down
+    global right_is_down
+    if event.button == mpl.backend_bases.MouseButton.LEFT:
+        left_is_down = True
+    elif event.button == mpl.backend_bases.MouseButton.RIGHT:
+        right_is_down = True
+def mouse_up(event):
+    global left_is_down
+    global right_is_down
+    if event.button == mpl.backend_bases.MouseButton.LEFT:
+        left_is_down = False
+    elif event.button == mpl.backend_bases.MouseButton.RIGHT:
+        right_is_down = False
+def mouse_moves(event):
+    global left_is_down
+    global right_is_down
+    global V_d
+    if left_is_down:
+        V_h[int(event.ydata), int(event.xdata)] = 999999.0
+        V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
+    elif right_is_down:
+        V_h[int(event.ydata), int(event.xdata)] = 0
+        V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
+
 reset_button_ax = plt.axes([0.81, 0.05, 0.1, 0.075])
 reset_button = widgets.Button(reset_button_ax, "Reset")
 reset_button.on_clicked(reset_clicked)
+fig.canvas.mpl_connect('button_press_event', mouse_down)
+fig.canvas.mpl_connect('button_release_event', mouse_up)
+fig.canvas.mpl_connect('motion_notify_event', mouse_moves)
 
 def time_integrate(i, *args):
     for _ in range(iters_per_frame):
