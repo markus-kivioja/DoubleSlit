@@ -6,12 +6,13 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from matplotlib import widgets
 
-N = 256
-h = 1 / N
-dt = h * 0.001
-inv_hSq = 1.0 / (h*h)
+N = 256 # Number of grid nodes per dimension
+h = 1 / N # Length between neighbour grid nodes
+dt = h * 0.001 # The greatest numerically stable time step size
+V_wall = 200000.0 # The biggest numerically stable potential for walls
+inv_hSq = 1.0 / (h*h) # For performance optimization
 
-# GPU code for computing one time step for every grid node simultaneously
+# GPU code for one central-difference time step for every grid node simultaneously
 take_timestep = cp.RawKernel(r'''
     #include <cupy/complex.cuh>
     extern "C" __global__
@@ -20,22 +21,22 @@ take_timestep = cp.RawKernel(r'''
         int y = blockDim.y * blockIdx.y + threadIdx.y;
         int idx = y * N + x;
 
-        // Infinite potential walls
-        if ((x == 0) || (x == (N - 1)) || (y == 0) || (y == (N - 1)) || (V[idx] > 99999))
+        // Dirichlet boundary condition: \psi = 0
+        if ((x == 0) || (x == (N - 1)) || (y == 0) || (y == (N - 1)))
         {
             next_psi[idx] = 0;
             return;
-        } 
+        }
 
         // Indices to neighboring elements
         int up_idx = (y + 1) * N + x;
         int down_idx = (y - 1) * N + x;
         int left_idx = y * N + (x - 1);
         int right_idx = y * N + (x + 1);
-        
+
         // Compute the Laplacian using finite difference method
-        complex<float> Laplacian = (prev_psi[right_idx] + prev_psi[left_idx] + 
-                     prev_psi[up_idx] + prev_psi[down_idx] - 
+        complex<float> Laplacian = (prev_psi[right_idx] + prev_psi[left_idx] +
+                     prev_psi[up_idx] + prev_psi[down_idx] -
                      4.0f * prev_psi[idx]) * inv_hSq;
 
         // The Hamiltonian
@@ -46,6 +47,42 @@ take_timestep = cp.RawKernel(r'''
     }
 ''', 'take_timestep')
 
+# GPU code for one forward Euler time step for every grid node simultaneously
+forward_euler = cp.RawKernel(r'''
+    #include <cupy/complex.cuh>
+    extern "C" __global__
+    void forward_euler(complex<float>* next_psi, const complex<float>* prev_psi, float inv_hSq, float dt, int N) {
+        int x = blockDim.x * blockIdx.x + threadIdx.x;
+        int y = blockDim.y * blockIdx.y + threadIdx.y;
+        int idx = y * N + x;
+
+        // Dirichlet boundary condition: \psi = 0
+        if ((x == 0) || (x == (N - 1)) || (y == 0) || (y == (N - 1)))
+        {
+            next_psi[idx] = 0;
+            return;
+        }
+
+        // Indices to neighboring elements
+        int up_idx = (y + 1) * N + x;
+        int down_idx = (y - 1) * N + x;
+        int left_idx = y * N + (x - 1);
+        int right_idx = y * N + (x + 1);
+
+        // Compute the Laplacian using finite difference method
+        complex<float> Laplacian = (prev_psi[right_idx] + prev_psi[left_idx] +
+                     prev_psi[up_idx] + prev_psi[down_idx] -
+                     4.0f * prev_psi[idx]) * inv_hSq;
+
+        // The Hamiltonian
+        complex<float> Hpsi = -0.5f * Laplacian;
+
+        // Time integrate using central difference method
+        next_psi[idx] = prev_psi[idx] + 0.5f * dt * complex<float>(0, -1) * Hpsi;
+    }
+''', 'forward_euler')
+
+# GPU code for computing the norm squared values of psi elements
 comp_normSq_phase = cp.RawKernel(r'''
     #include <cupy/complex.cuh>
     extern "C" __global__
@@ -70,45 +107,55 @@ def integrate_normSq(psi):
 block_size = (8, 8,)
 grid_size = (math.ceil(N / block_size[0]), math.ceil(N / block_size[1]),)
 
-even_psi_h = np.zeros((N, N), dtype=np.complex64)
 odd_psi_h = np.zeros((N, N), dtype=np.complex64)
 V_h = np.zeros((N, N), dtype=np.float32)
 
-# Initialize the wave function and potential
-sigma = 1 / 12.
-pos0_x = 3 * sigma
+# Initialize the wave function with a wave packet
+radius = 1 / 11.
+pos0_x = 3 * radius
 pos0_y = 0.5
-k = -18.0 * 2*np.pi
+momentum = -18.0 * 2*np.pi
 for x_id in range(N):
     for y_id in range(N):
         x = x_id * h
         y = y_id * h
         diff_x = x - pos0_x
         diff_y = y - pos0_y
-        psi = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * sigma * sigma))
-        phase = np.sin(k*x) + 1j*np.cos(k*x)
-        even_psi_h[y_id, x_id] = psi * phase
+        psi = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * radius * radius))
+        phase = np.sin(momentum*x) + 1j*np.cos(momentum*x)
         odd_psi_h[y_id, x_id] = psi * phase
 
 # Normalize the wave function
-normSq = integrate_normSq(even_psi_h)
-even_psi_h /= np.sqrt(normSq)
-odd_psi_h /= np.sqrt(normSq)
 normSq = integrate_normSq(odd_psi_h)
+odd_psi_h /= np.sqrt(normSq)
 
 # Copy data from CPU to GPU
-even_psi_d = cp.array(even_psi_h.reshape(-1), dtype=cp.complex64)
 odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
 
-def add_double_slit():
+even_psi_d = cp.zeros(N*N, dtype=cp.complex64)
+forward_euler(grid_size, block_size, (even_psi_d, odd_psi_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
+
+# Add the 2x5 lattice potential
+def add_v_lattice():
     global V_h
     global V_d
-    V_h[0:int(N * 0.41), int(N * 0.8):int(N * 0.82)] = 999999.0
-    V_h[int(N * 0.46):int(N * 0.54), int(N * 0.8):int(N * 0.82)] = 999999.0
-    V_h[int(N * 0.59):N, int(N * 0.8):int(N * 0.82)] = 999999.0
+    wall_width = 0.08
+    wall_height = 0.01
+    wall_gap_y = 0.05
+    wall_gap_x = 0.071
+    wall_offset_y = 0.5 - (5 * wall_width + 4 * wall_gap_y) * 0.5
+    wall_offset_x = 0.75
+    for x in range(2):
+        for y in range(5):
+            y_start = wall_offset_y + y * (wall_width + wall_gap_y)
+            y_end = y_start + wall_width
+            x_start = wall_offset_x + x * (wall_height + wall_gap_x)
+            x_end = x_start + wall_height
+            V_h[math.ceil(y_start*N):math.ceil(y_end*N), math.ceil(x_start*N):math.ceil(x_end*N)] = V_wall
+
     V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 
-add_double_slit()
+add_v_lattice()
 
 iters_per_frame = 2
 is_playing = False
@@ -148,22 +195,37 @@ def play_toggle_clicked(event):
     play_toggle_button.canvas.draw_idle()
 def reset_state_clicked(event):
     global even_psi_d, odd_psi_d
-    even_psi_d = cp.array(even_psi_h.reshape(-1), dtype=cp.complex64)
     odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
+    forward_euler(grid_size, block_size, (even_psi_d, odd_psi_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
 def clear_v_clicked(event):
     global V_h
     global V_d
     V_h[0:N, 0:N] = 0.0
     V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
-def double_slit_clicked(event):
-    add_double_slit()
+def add_lattice_clicked(event):
+    add_v_lattice()
 def mouse_down(event):
     global left_is_down
     global right_is_down
+    global V_d
+    if event.xdata is None or event.ydata is None or event.xdata < 1 or event.ydata < 1:
+        return
     if event.button == mpl.backend_bases.MouseButton.LEFT:
         left_is_down = True
     elif event.button == mpl.backend_bases.MouseButton.RIGHT:
         right_is_down = True
+    x = int(event.xdata)
+    y = int(event.ydata)
+    if left_is_down:
+        for x_offset in range(-1,2):
+            for y_offset in range(0,3):
+                V_h[y + y_offset, x + x_offset] = V_wall
+        V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
+    elif right_is_down:
+        for x_offset in range(-2,3):
+            for y_offset in range(-2,3):
+                V_h[y + y_offset, x + x_offset] = 0.0
+        V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 def mouse_up(event):
     global left_is_down
     global right_is_down
@@ -175,18 +237,18 @@ def mouse_moves(event):
     global left_is_down
     global right_is_down
     global V_d
-    if event.xdata is None or event.ydata is None:
+    if event.xdata is None or event.ydata is None or event.xdata < 1 or event.ydata < 1:
         return
     x = int(event.xdata)
     y = int(event.ydata)
     if left_is_down:
-        for x_offset in range(-2,2):
-            for y_offset in range(-2,2):
-                V_h[y + y_offset, x + x_offset] = 999999.0
+        for x_offset in range(-1,2):
+            for y_offset in range(0,3):
+                V_h[y + y_offset, x + x_offset] = V_wall
         V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
     elif right_is_down:
-        for x_offset in range(-3,3):
-            for y_offset in range(-3,3):
+        for x_offset in range(-2,3):
+            for y_offset in range(-2,3):
                 V_h[y + y_offset, x + x_offset] = 0.0
         V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 
@@ -206,8 +268,8 @@ clear_v_button = widgets.Button(clear_v_button_ax, "Clear potential")
 clear_v_button.on_clicked(clear_v_clicked)
 button_left += button_width + button_gap
 add_double_slit_ax = plt.axes([button_left, 0.9, button_width, 0.075])
-add_double_slit_button = widgets.Button(add_double_slit_ax, "Add double-slit")
-add_double_slit_button.on_clicked(double_slit_clicked)
+add_double_slit_button = widgets.Button(add_double_slit_ax, "Add lattice")
+add_double_slit_button.on_clicked(add_lattice_clicked)
 fig.canvas.mpl_connect('button_press_event', mouse_down)
 fig.canvas.mpl_connect('button_release_event', mouse_up)
 fig.canvas.mpl_connect('motion_notify_event', mouse_moves)
