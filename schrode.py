@@ -9,15 +9,18 @@ from matplotlib import widgets
 N = 256
 h = 1 / N
 dt = h * 0.001
+inv_hSq = 1.0 / (h*h)
 
+# GPU code for computing one time step for every grid node simultaneously
 take_timestep = cp.RawKernel(r'''
     #include <cupy/complex.cuh>
     extern "C" __global__
-    void take_timestep(complex<float>* next_psi, const complex<float>* prev_psi, const float* V, float h, float dt, int N) {
+    void take_timestep(complex<float>* next_psi, const complex<float>* prev_psi, const float* V, float inv_hSq, float dt, int N) {
         int x = blockDim.x * blockIdx.x + threadIdx.x;
         int y = blockDim.y * blockIdx.y + threadIdx.y;
         int idx = y * N + x;
 
+        // Infinite potential walls
         if ((x == 0) || (x == (N - 1)) || (y == 0) || (y == (N - 1)) || (V[idx] > 99999))
         {
             next_psi[idx] = 0;
@@ -33,7 +36,7 @@ take_timestep = cp.RawKernel(r'''
         // Compute the Laplacian using finite difference method
         complex<float> Laplacian = (prev_psi[right_idx] + prev_psi[left_idx] + 
                      prev_psi[up_idx] + prev_psi[down_idx] - 
-                     4.0f * prev_psi[idx]) / (h * h);
+                     4.0f * prev_psi[idx]) * inv_hSq;
 
         // The Hamiltonian
         complex<float> Hpsi = -0.5f * Laplacian + V[idx] * prev_psi[idx];
@@ -100,7 +103,7 @@ def set_initial_condition():
     even_psi_d = cp.array(even_psi_h.reshape(-1), dtype=cp.complex64)
     odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
 
-def set_double_slit():
+def add_double_slit():
     global V_h
     global V_d
     V_h[0:int(N * 0.41), int(N * 0.8):int(N * 0.82)] = 999999.0
@@ -109,29 +112,55 @@ def set_double_slit():
     V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 
 set_initial_condition()
-set_double_slit()
+add_double_slit()
 
-# Initialize the visualization
+iters_per_frame = 2
+is_playing = False
+
+def time_integrate(i, *args):
+    if is_playing:
+        for _ in range(iters_per_frame):
+            # Update an odd time step
+            take_timestep(grid_size, block_size, (odd_psi_d, even_psi_d, V_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
+            # Update an even time step
+            take_timestep(grid_size, block_size, (even_psi_d, odd_psi_d, V_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
+
+        # Compute the probability/phase and visualize
+        comp_normSq_phase(grid_size, block_size, (normSq_d, phase_d, even_psi_d, cp.int32(N)))
+    
+    im.set_data(V_d.get().reshape((N, N)) + normSq_d.get().reshape((N, N)))
+    return im,
+
+
+
+
+############ Add the visualization and user interface ############
 normSq_d = cp.zeros(N*N, dtype=cp.float32)
 phase_d = cp.zeros(N*N, dtype=cp.float32)
 fig, ax = plt.subplots()
 comp_normSq_phase(grid_size, block_size, (normSq_d, phase_d, even_psi_d, cp.int32(N)))
 im = ax.imshow(normSq_d.get().reshape((N, N)), animated=True)
-iters_per_frame = 2
+left_is_down = False
+right_is_down = False
 
-# Add user interface
+def play_toggle_clicked(event):
+    global is_playing
+    is_playing = not is_playing
+    if is_playing:
+        play_toggle_button.label.set_text("Pause")
+    else:
+        play_toggle_button.label.set_text("Play")
+    play_toggle_button.canvas.draw_idle()
 def reset_state_clicked(event):
     global even_psi_d, odd_psi_d, V_d
     set_initial_condition()
-def remove_v_clicked(event):
+def clear_v_clicked(event):
     global V_h
     global V_d
     V_h[0:N, 0:N] = 0.0
     V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 def double_slit_clicked(event):
-    set_double_slit()
-left_is_down = False
-right_is_down = False
+    add_double_slit()
 def mouse_down(event):
     global left_is_down
     global right_is_down
@@ -154,7 +183,6 @@ def mouse_moves(event):
         V_h[int(event.ydata), int(event.xdata)] = 999999.0
         V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
     elif right_is_down:
-        print("DELETE")
         V_h[int(event.ydata), int(event.xdata)] = 0.0
         V_h[int(event.ydata)+1, int(event.xdata)] = 0.0
         V_h[int(event.ydata)-1, int(event.xdata)] = 0.0
@@ -162,30 +190,27 @@ def mouse_moves(event):
         V_h[int(event.ydata), int(event.xdata)-1] = 0.0
         V_d = cp.array(V_h.reshape(-1), dtype=cp.float32)
 
-reset_state_button_ax = plt.axes([0.81, 0.05, 0.1, 0.075])
-reset_state_button = widgets.Button(reset_state_button_ax, "Reset wave function")
+button_width = 0.17
+button_gap = 0.01
+button_left = 0.15
+play_toggle_button_ax = plt.axes([button_left, 0.9, button_width, 0.075])
+play_toggle_button = widgets.Button(play_toggle_button_ax, "Play")
+play_toggle_button.on_clicked(play_toggle_clicked)
+button_left += button_width + button_gap
+reset_state_button_ax = plt.axes([button_left, 0.9, button_width, 0.075])
+reset_state_button = widgets.Button(reset_state_button_ax, "Reset particle")
 reset_state_button.on_clicked(reset_state_clicked)
-remove_v_button_ax = plt.axes([0.81, 0.2, 0.1, 0.075])
-remove_v_button = widgets.Button(remove_v_button_ax, "Remove potential")
-remove_v_button.on_clicked(remove_v_clicked)
-add_double_slit_ax = plt.axes([0.81, 0.4, 0.1, 0.075])
-add_double_slit_button = widgets.Button(add_double_slit_ax, "Add double-slit potential")
+button_left += button_width + button_gap
+clear_v_button_ax = plt.axes([button_left, 0.9, button_width, 0.075])
+clear_v_button = widgets.Button(clear_v_button_ax, "Clear potential")
+clear_v_button.on_clicked(clear_v_clicked)
+button_left += button_width + button_gap
+add_double_slit_ax = plt.axes([button_left, 0.9, button_width, 0.075])
+add_double_slit_button = widgets.Button(add_double_slit_ax, "Add double-slit")
 add_double_slit_button.on_clicked(double_slit_clicked)
 fig.canvas.mpl_connect('button_press_event', mouse_down)
 fig.canvas.mpl_connect('button_release_event', mouse_up)
 fig.canvas.mpl_connect('motion_notify_event', mouse_moves)
-
-def time_integrate(i, *args):
-    for _ in range(iters_per_frame):
-        # Update an odd time step
-        take_timestep(grid_size, block_size, (odd_psi_d, even_psi_d, V_d, cp.float32(h), cp.float32(dt), cp.int32(N)))
-        # Update an even time step
-        take_timestep(grid_size, block_size, (even_psi_d, odd_psi_d, V_d, cp.float32(h), cp.float32(dt), cp.int32(N)))
-
-    # Compute the probability/phase and visualize
-    comp_normSq_phase(grid_size, block_size, (normSq_d, phase_d, even_psi_d, cp.int32(N)))
-    im.set_data(V_d.get().reshape((N, N)) + normSq_d.get().reshape((N, N)))
-    return im,
 
 ani = animation.FuncAnimation(fig, time_integrate, interval=1, blit=True)
 plt.show()
