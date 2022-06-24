@@ -8,7 +8,7 @@ from matplotlib import widgets
 
 N = 256 # Number of grid nodes per dimension
 h = 1 / N # Length between neighbour grid nodes
-dt = h * 0.001 # The greatest numerically stable time step size
+dt = 0.14 * h*h # The greatest numerically stable time step size
 V_wall = 200000.0 # The biggest numerically stable potential for walls
 inv_hSq = 1.0 / (h*h) # For performance optimization
 
@@ -43,7 +43,7 @@ take_timestep = cp.RawKernel(r'''
         complex<float> Hpsi = -0.5f * Laplacian + V[idx] * prev_psi[idx];
 
         // Time integrate using central difference method
-        next_psi[idx] += dt * complex<float>(0, -1) * Hpsi;
+        next_psi[idx] += 2.0f * dt * complex<float>(0, -1) * Hpsi;
     }
 ''', 'take_timestep')
 
@@ -78,7 +78,7 @@ forward_euler = cp.RawKernel(r'''
         complex<float> Hpsi = -0.5f * Laplacian;
 
         // Time integrate using central difference method
-        next_psi[idx] = prev_psi[idx] + 0.5f * dt * complex<float>(0, -1) * Hpsi;
+        next_psi[idx] = prev_psi[idx] + dt * complex<float>(0, -1) * Hpsi;
     }
 ''', 'forward_euler')
 
