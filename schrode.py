@@ -115,7 +115,7 @@ V_h = np.zeros((N, N), dtype=np.float32)
 radius = 1 / 11.
 pos0_x = 3 * radius
 pos0_y = 0.5
-momentum = -18.0 * 2*np.pi
+momentum = 18.0 * 2*np.pi
 for x_id in range(N):
     for y_id in range(N):
         x = x_id * h
@@ -123,7 +123,7 @@ for x_id in range(N):
         diff_x = x - pos0_x
         diff_y = y - pos0_y
         psi = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * radius * radius))
-        phase = np.sin(momentum*x) + 1j*np.cos(momentum*x)
+        phase = np.cos(momentum*x) + 1j*np.sin(momentum*x)
         odd_psi_h[y_id, x_id] = psi * phase
 
 # Normalize the wave function
