@@ -9,7 +9,8 @@ from matplotlib import widgets
 N = 256 # Number of grid nodes per dimension
 h = 1 / N # Length between neighbour grid nodes
 dt = 0.14 * h*h # The greatest numerically stable time step size
-V_wall = 200000.0 # The biggest numerically stable potential for walls
+V_wall = 200000.0 # The greatest numerically stable potential for walls
+
 inv_hSq = 1.0 / (h*h) # For performance optimization
 
 # GPU code for one central-difference time step for every grid node simultaneously
@@ -51,7 +52,7 @@ take_timestep = cp.RawKernel(r'''
 forward_euler = cp.RawKernel(r'''
     #include <cupy/complex.cuh>
     extern "C" __global__
-    void forward_euler(complex<float>* next_psi, const complex<float>* prev_psi, float inv_hSq, float dt, int N) {
+    void forward_euler(complex<float>* next_psi, const complex<float>* prev_psi, const float* V, float inv_hSq, float dt, int N) {
         int x = blockDim.x * blockIdx.x + threadIdx.x;
         int y = blockDim.y * blockIdx.y + threadIdx.y;
         int idx = y * N + x;
@@ -75,7 +76,7 @@ forward_euler = cp.RawKernel(r'''
                      4.0f * prev_psi[idx]) * inv_hSq;
 
         // The Hamiltonian
-        complex<float> Hpsi = -0.5f * Laplacian;
+        complex<float> Hpsi = -0.5f * Laplacian + V[idx] * prev_psi[idx];
 
         // Time integrate using central difference method
         next_psi[idx] = prev_psi[idx] + dt * complex<float>(0, -1) * Hpsi;
@@ -132,9 +133,6 @@ odd_psi_h /= np.sqrt(normSq)
 # Copy data from CPU to GPU
 odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
 
-even_psi_d = cp.zeros(N*N, dtype=cp.complex64)
-forward_euler(grid_size, block_size, (even_psi_d, odd_psi_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
-
 # Add the 2x5 lattice potential
 def add_v_lattice():
     global V_h
@@ -157,9 +155,14 @@ def add_v_lattice():
 
 add_v_lattice()
 
+# Take one forward Euler step to form the other needed initial value
+even_psi_d = cp.zeros(N*N, dtype=cp.complex64)
+forward_euler(grid_size, block_size, (even_psi_d, odd_psi_d, V_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
+
 iters_per_frame = 2
 is_playing = False
 
+### The main loop - central difference time integration of the Schrödinger equation ###
 def time_integrate(i, *args):
     if is_playing:
         for _ in range(iters_per_frame):
@@ -176,7 +179,7 @@ def time_integrate(i, *args):
 
 
 
-############ Add the user interface and visualization ############
+############ The user interface and visualization ############
 normSq_d = cp.zeros(N*N, dtype=cp.float32)
 phase_d = cp.zeros(N*N, dtype=cp.float32)
 fig, ax = plt.subplots()
@@ -196,7 +199,7 @@ def play_toggle_clicked(event):
 def reset_state_clicked(event):
     global even_psi_d, odd_psi_d
     odd_psi_d = cp.array(odd_psi_h.reshape(-1), dtype=cp.complex64)
-    forward_euler(grid_size, block_size, (even_psi_d, odd_psi_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
+    forward_euler(grid_size, block_size, (even_psi_d, odd_psi_d, V_d, cp.float32(inv_hSq), cp.float32(dt), cp.int32(N)))
 def clear_v_clicked(event):
     global V_h
     global V_d
@@ -275,4 +278,6 @@ fig.canvas.mpl_connect('button_release_event', mouse_up)
 fig.canvas.mpl_connect('motion_notify_event', mouse_moves)
 
 ani = animation.FuncAnimation(fig, time_integrate, interval=0, blit=True)
+
+# Start the program
 plt.show()
