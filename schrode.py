@@ -122,9 +122,9 @@ for x_id in range(N):
         y = y_id * h
         diff_x = x - pos0_x
         diff_y = y - pos0_y
-        psi = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * radius * radius))
+        magnitude = np.exp(-(diff_x*diff_x + diff_y*diff_y) / (2 * radius * radius))
         phase = np.cos(momentum*x) + 1j*np.sin(momentum*x)
-        odd_psi_h[y_id, x_id] = psi * phase
+        odd_psi_h[y_id, x_id] = magnitude * phase
 
 # Normalize the wave function
 normSq = integrate_normSq(odd_psi_h)
